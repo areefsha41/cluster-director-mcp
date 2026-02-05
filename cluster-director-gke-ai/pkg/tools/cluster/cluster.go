@@ -84,6 +84,13 @@ type handlers struct {
 	c *config.Config
 }
 
+// Struct for checking instance consumption
+type CheckConsumptionRequest struct {
+	InstanceName string `json:"InstanceName" jsonschema:"description=Name of the GCE instance to check"`
+	Zone         string `json:"Zone" jsonschema:"description=GCP Zone (e.g., us-central1-a)"`
+	ProjectID    string `json:"ProjectID,omitempty" jsonschema:"description=GCP Project ID. Optional if default is set."`
+}
+
 type LogSearchType int
 
 const (
@@ -323,6 +330,43 @@ func Install(s *mcp.Server, c *config.Config) {
 			},
 		}, nil, nil
 	})
+
+	// Check Instance Consumption Type
+	checkConsumptionTool := mcp.Tool{
+		Name:        "check_instance_consumption",
+		Description: "Check if a GCE instance is Spot, On-Demand, or consuming a Reservation. If Zone is not provided, the tool searches for it.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:   true,
+			IdempotentHint: true,
+		},
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"InstanceName": map[string]interface{}{
+					"type":        "string",
+					"description": "Name of the GCE instance",
+				},
+				"Zone": map[string]interface{}{
+					"type":        "string",
+					"description": "GCP Zone (e.g., us-central1-a). Optional: If omitted, the tool will search for the instance.",
+				},
+				"ProjectID": map[string]interface{}{
+					"type":        "string",
+					"description": "GCP Project ID. Optional: If omitted, uses default config.",
+				},
+			},
+			"required": []string{"InstanceName"},
+		},
+	}
+	mcp.AddTool(
+		s,
+		&checkConsumptionTool,
+		func(ctx context.Context, _ *mcp.CallToolRequest, req CheckConsumptionRequest) (*mcp.CallToolResult, SearchLogsResponse, error) {
+			result, err := h.checkConsumptionMCP(ctx, req)
+			return nil, SearchLogsResponse{Status: result}, err
+		},
+	)
+
 }
 
 // func (h *handlers) searchLogsMCP(ctx context.Context, request *SearchLogsRequest, searchType LogSearchType) (string, error) {
@@ -901,4 +945,17 @@ func getVersionCheckStatus(projectID string, jobObj *persistence.LongRunningJob)
 	}
 
 	return "Job is running...", true
+}
+
+// Implementation (Calling Shared GenericCore)
+func (h *handlers) checkConsumptionMCP(ctx context.Context, req CheckConsumptionRequest) (string, error) {
+	// Map the local request struct to the shared struct
+	sharedReq := genericCore.CheckConsumptionRequestShared{
+		InstanceName: req.InstanceName,
+		Zone:         req.Zone,
+		ProjectID:    req.ProjectID,
+	}
+
+	// Call the shared core logic
+	return genericCore.CheckInstanceConsumptionCore(ctx, sharedReq, h.c.GetDefaultProjectID())
 }

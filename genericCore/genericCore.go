@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"google.golang.org/api/compute/v1"
+	"google.golang.org/api/option" 
 )
 
 const maxLogFiles = 100
@@ -48,7 +49,16 @@ type GcloudListItem struct {
 	Name string `json:"name"`
 }
 
+// CheckConsumptionRequestShared is the struct used by both Slurm and GKE tools
+type CheckConsumptionRequestShared struct {
+	InstanceName string
+	Zone         string
+	ProjectID    string
+}
+
 func WriteToLog(message string) {
+
+	message = strings.ReplaceAll(message, "\n", " | ")
 
 	if logger == nil {
 		f := CreateUniqueFilePath("logs/log.cluster-director-mcp")
@@ -606,4 +616,126 @@ func buildDataFromReservation(zone string, res *compute.Reservation, instances [
 		IdleVms:     idleVms,
 		Nodes:       vmNames,
 	}
+}
+
+// CheckInstanceConsumptionCore is the shared implementation for checking Spot/Reservation status.
+// It includes "Smart Search" to find the instance if the zone is missing.
+func CheckInstanceConsumptionCore(ctx context.Context, req CheckConsumptionRequestShared, defaultProjectID string) (string, error) {
+	WriteToLog("CheckInstanceConsumptionCore.0000")
+
+	// 1. Determine Project ID
+	projectID := req.ProjectID
+	if projectID == "" {
+		projectID = defaultProjectID
+	}
+	if projectID == "" {
+		return "Could not determine GCP project. Please run: gcloud config set project \"your-project-name\" and restart the AI Assistant", nil
+	}
+
+	// 2. Initialize Compute Service
+	service, err := compute.NewService(ctx, option.WithScopes(compute.ComputeScope))
+	if err != nil {
+		WriteToLog(fmt.Sprintf("CheckInstanceConsumptionCore Error creating service: %v", err))
+		return fmt.Sprintf("Failed to create compute service: %v", err), nil
+	}
+
+	var instance *compute.Instance
+
+	// 3. SMART SEARCH LOGIC (Addresses "Zone" ambiguity)
+	if req.Zone == "" {
+		WriteToLog("CheckInstanceConsumptionCore: Zone is empty, searching for " + req.InstanceName)
+
+		filter := fmt.Sprintf("name = \"%s\"", req.InstanceName)
+		aggregatedListReq := service.Instances.AggregatedList(projectID).Filter(filter)
+
+		var foundInstances []*compute.Instance
+		var foundZones []string
+
+		// Iterate over all zones in the project
+		err := aggregatedListReq.Pages(ctx, func(page *compute.InstanceAggregatedList) error {
+			for zonePath, scopedList := range page.Items {
+				if len(scopedList.Instances) > 0 {
+					for _, inst := range scopedList.Instances {
+						if inst.Name == req.InstanceName {
+							foundInstances = append(foundInstances, inst)
+							// Extract zone name from "zones/us-central1-a"
+							parts := strings.Split(zonePath, "/")
+							foundZones = append(foundZones, parts[len(parts)-1])
+						}
+					}
+				}
+			}
+			return nil
+		})
+
+		if err != nil {
+			return fmt.Sprintf("Failed to search project for instance: %v", err), nil
+		}
+
+		if len(foundInstances) == 0 {
+			return fmt.Sprintf("Error: Could not find any instance named '%s' in project '%s'. Please check the name or provide a zone.", req.InstanceName, projectID), nil
+		}
+
+		if len(foundInstances) > 1 {
+			return fmt.Sprintf("Error: Ambiguous. Found multiple instances named '%s' in zones: %v. Please specify the zone.", req.InstanceName, foundZones), nil
+		}
+
+		// Success: We found exactly one
+		instance = foundInstances[0]
+		req.Zone = foundZones[0]
+		WriteToLog("CheckInstanceConsumptionCore: Successfully found instance in zone " + req.Zone)
+
+	} else {
+		// Old Path: Zone was provided, fetch directly
+		instance, err = service.Instances.Get(projectID, req.Zone, req.InstanceName).Context(ctx).Do()
+		if err != nil {
+			WriteToLog(fmt.Sprintf("CheckInstanceConsumptionCore Error getting instance: %v", err))
+			return fmt.Sprintf("Could not get instance %s in zone %s: %v", req.InstanceName, req.Zone, err), nil
+		}
+	}
+
+	// 4. Analyze the Instance
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Analyzing Instance: %s (Zone: %s)\n", instance.Name, req.Zone))
+
+	// Check for SPOT / Preemptible
+	isSpot := false
+	if instance.Scheduling != nil {
+		if instance.Scheduling.ProvisioningModel == "SPOT" {
+			isSpot = true
+			sb.WriteString("Type: SPOT VM (No max duration)\n")
+		} else if instance.Scheduling.Preemptible {
+			isSpot = true
+			sb.WriteString("Type: LEGACY PREEMPTIBLE VM (24h max duration)\n")
+		}
+	}
+
+	if !isSpot {
+		sb.WriteString("Type: STANDARD VM\n")
+	}
+
+	// Check for Reservation Usage
+	if instance.ReservationAffinity != nil {
+		switch instance.ReservationAffinity.ConsumeReservationType {
+		case "NO_RESERVATION":
+			sb.WriteString("Reservation: None (Explicitly configured to not use reservations)\n")
+		case "ANY_RESERVATION":
+			sb.WriteString("Reservation: CONSUMING (Automatic/Any matching reservation)\n")
+		case "SPECIFIC_RESERVATION":
+			key := instance.ReservationAffinity.Key
+			val := ""
+			if len(instance.ReservationAffinity.Values) > 0 {
+				val = instance.ReservationAffinity.Values[0]
+			}
+			sb.WriteString(fmt.Sprintf("Reservation: CONSUMING SPECIFIC (Key: %s, Value: %s)\n", key, val))
+		default:
+			sb.WriteString("Reservation: None (On-Demand)\n")
+		}
+	} else {
+		sb.WriteString("Reservation: None (On-Demand / Default)\n")
+	}
+
+	result := sb.String()
+	WriteToLog("CheckInstanceConsumptionCore result: " + result)
+	return result, nil
 }
