@@ -131,10 +131,11 @@ type handlers struct {
 	c *config.Config
 }
 
+// Struct for checking instance consumption
 type CheckConsumptionRequest struct {
-	InstanceName string `json:"InstanceName" jsonschema:"description=Name of the GCE instance to check"`
-	Zone         string `json:"Zone" jsonschema:"description=GCP Zone (e.g., us-central1-a). Optional: If omitted, the tool will search for the instance."`
-	ProjectID    string `json:"ProjectID,omitempty" jsonschema:"description=GCP Project ID. Optional if default is set."`
+	InstanceNames []string `json:"InstanceNames" jsonschema:"description=List of GCE instance names to check"`
+	Zone          string   `json:"Zone" jsonschema:"description=GCP Zone (e.g., us-central1-a). Optional: If omitted, the tool will search for the instances."`
+	ProjectID     string   `json:"ProjectID,omitempty" jsonschema:"description=GCP Project ID. Optional if default is set."`
 }
 
 func Install(s *mcp.Server, c *config.Config) {
@@ -599,7 +600,7 @@ func Install(s *mcp.Server, c *config.Config) {
 	// Check Instance Consumption Type
 	checkConsumptionTool := mcp.Tool{
 		Name:        "check_instance_consumption",
-		Description: "Check if a GCE instance is Spot, On-Demand, or consuming a Reservation. If Zone is not provided, the tool searches for it.",
+		Description: "Check if GCE instances are Spot, On-Demand, or consuming a Reservation. Accepts a list of names. If Zone is not provided, the tool searches for them.",
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:   true,
 			IdempotentHint: true,
@@ -607,20 +608,24 @@ func Install(s *mcp.Server, c *config.Config) {
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				"InstanceName": map[string]interface{}{
-					"type":        "string",
-					"description": "Name of the GCE instance",
+				// CHANGED: Defined as an ARRAY of strings
+				"InstanceNames": map[string]interface{}{
+					"type": "array",
+					"items": map[string]interface{}{
+						"type": "string",
+					},
+					"description": "List of GCE instance names",
 				},
 				"Zone": map[string]interface{}{
 					"type":        "string",
-					"description": "GCP Zone. Optional: If omitted, the tool will search for the instance.",
+					"description": "GCP Zone. Optional: If omitted, the tool will search for the instances.",
 				},
 				"ProjectID": map[string]interface{}{
 					"type":        "string",
 					"description": "GCP Project ID. Optional.",
 				},
 			},
-			"required": []string{"InstanceName"},
+			"required": []string{"InstanceNames"}, // Required field is now the list
 		},
 	}
 	mcp.AddTool(
@@ -1716,12 +1721,39 @@ func getVersionCheckStatus(projectID string, jobObj *persistence.LongRunningJob)
 	return "Job is running...", true
 }
 
-// Implementation (Calling Shared GenericCore)
+// Implementation (Looping Wrapper)
 func (h *handlers) checkConsumptionMCP(ctx context.Context, req CheckConsumptionRequest) (string, error) {
-	sharedReq := genericCore.CheckConsumptionRequestShared{
-		InstanceName: req.InstanceName,
-		Zone:         req.Zone,
-		ProjectID:    req.ProjectID,
+	var sb strings.Builder
+	
+	// Loop through all requested instances
+	for i, name := range req.InstanceNames {
+		// 1. Prepare the shared request for THIS single instance
+		// We map the loop variable 'name' to the single 'InstanceName' field in genericCore
+		sharedReq := genericCore.CheckConsumptionRequestShared{
+			InstanceName: name,         
+			Zone:         req.Zone,     
+			ProjectID:    req.ProjectID,
+		}
+
+		// 2. Call your existing, working Generic Core function
+		result, err := genericCore.CheckInstanceConsumptionCore(ctx, sharedReq, h.c.GetDefaultProjectID())
+		
+		// 3. Format the output
+		if err != nil {
+			sb.WriteString(fmt.Sprintf("Instance: %s | Error: %v\n", name, err))
+		} else {
+			sb.WriteString(result)
+		}
+
+		// Add a separator between results (but not after the last one)
+		if i < len(req.InstanceNames)-1 {
+			sb.WriteString("\n---\n")
+		}
 	}
-	return genericCore.CheckInstanceConsumptionCore(ctx, sharedReq, h.c.GetDefaultProjectID())
+
+	if sb.Len() == 0 {
+		return "No instances provided.", nil
+	}
+
+	return sb.String(), nil
 }
