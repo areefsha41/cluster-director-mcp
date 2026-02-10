@@ -608,7 +608,6 @@ func Install(s *mcp.Server, c *config.Config) {
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				// CHANGED: Defined as an ARRAY of strings
 				"InstanceNames": map[string]interface{}{
 					"type": "array",
 					"items": map[string]interface{}{
@@ -625,7 +624,7 @@ func Install(s *mcp.Server, c *config.Config) {
 					"description": "GCP Project ID. Optional.",
 				},
 			},
-			"required": []string{"InstanceNames"}, // Required field is now the list
+			"required": []string{"InstanceNames"},
 		},
 	}
 	mcp.AddTool(
@@ -1721,39 +1720,37 @@ func getVersionCheckStatus(projectID string, jobObj *persistence.LongRunningJob)
 	return "Job is running...", true
 }
 
-// Implementation (Looping Wrapper)
+// Implementation 
 func (h *handlers) checkConsumptionMCP(ctx context.Context, req CheckConsumptionRequest) (string, error) {
-	var sb strings.Builder
-	
-	// Loop through all requested instances
-	for i, name := range req.InstanceNames {
-		// 1. Prepare the shared request for THIS single instance
-		// We map the loop variable 'name' to the single 'InstanceName' field in genericCore
+	var results []genericCore.InstanceConsumptionStatus
+
+	for _, name := range req.InstanceNames {
 		sharedReq := genericCore.CheckConsumptionRequestShared{
-			InstanceName: name,         
-			Zone:         req.Zone,     
+			InstanceName: name,
+			Zone:         req.Zone,
 			ProjectID:    req.ProjectID,
 		}
 
-		// 2. Call your existing, working Generic Core function
-		result, err := genericCore.CheckInstanceConsumptionCore(ctx, sharedReq, h.c.GetDefaultProjectID())
+		info, err := genericCore.CheckInstanceConsumptionCore(ctx, sharedReq, h.c.GetDefaultProjectID())
 		
-		// 3. Format the output
 		if err != nil {
-			sb.WriteString(fmt.Sprintf("Instance: %s | Error: %v\n", name, err))
+			results = append(results, genericCore.InstanceConsumptionStatus{
+				InstanceName:      name,
+				ReservationStatus: fmt.Sprintf("Error: %v", err),
+			})
 		} else {
-			sb.WriteString(result)
-		}
-
-		// Add a separator between results (but not after the last one)
-		if i < len(req.InstanceNames)-1 {
-			sb.WriteString("\n---\n")
+			results = append(results, info)
 		}
 	}
 
-	if sb.Len() == 0 {
-		return "No instances provided.", nil
+	if len(results) == 0 {
+		return "[]", nil
 	}
 
-	return sb.String(), nil
+	jsonBytes, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to generate JSON output: %v", err)
+	}
+
+	return string(jsonBytes), nil
 }

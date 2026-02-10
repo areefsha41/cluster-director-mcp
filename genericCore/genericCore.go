@@ -56,6 +56,13 @@ type CheckConsumptionRequestShared struct {
 	ProjectID    string
 }
 
+type InstanceConsumptionStatus struct {
+	InstanceName      string `json:"instance_name"`
+	Zone              string `json:"zone"`
+	ProvisioningModel string `json:"provisioning_model"`
+	ReservationStatus string `json:"reservation_status"`
+}
+
 func WriteToLog(message string) {
 
 	message = strings.ReplaceAll(message, "\n", " | ")
@@ -618,27 +625,21 @@ func buildDataFromReservation(zone string, res *compute.Reservation, instances [
 	}
 }
 
-// Helper to find a matching reservation for an instance configured with "ANY_RESERVATION"
+
 func findMatchingReservation(ctx context.Context, service *compute.Service, projectID, zone string, instance *compute.Instance) (string, error) {
-	// 1. List all reservations in the specific zone
 	req := service.Reservations.List(projectID, zone)
 	var matchingRes []string
 
 	err := req.Pages(ctx, func(page *compute.ReservationList) error {
 		for _, res := range page.Items {
-			// Criterion A: The reservation must allow "Any" (SpecificReservationRequired == false)
 			if res.SpecificReservationRequired {
 				continue
 			}
-			// Criterion B: The reservation must be READY
 			if res.Status != "READY" {
 				continue
 			}
 
-			// Criterion C: Machine Type must match
 			if res.SpecificReservation != nil && res.SpecificReservation.InstanceProperties != nil {
-				// The API returns full URLs (e.g., .../zones/us-central1-a/machineTypes/a3-megagpu-8g)
-				// We need to compare just the names.
 				resMachineType := GetResourceNameFromURL(res.SpecificReservation.InstanceProperties.MachineType)
 				instMachineType := GetResourceNameFromURL(instance.MachineType)
 
@@ -655,43 +656,41 @@ func findMatchingReservation(ctx context.Context, service *compute.Service, proj
 	}
 
 	if len(matchingRes) == 0 {
-		return "", nil // No match found
+		return "", nil 
 	}
-	// Return the name (or comma-separated list if multiple candidates exist)
 	return strings.Join(matchingRes, ", "), nil
 }
 
-// CheckInstanceConsumptionCore (Smart Version)
-// Checks if instance is Spot, Specific Reservation, or Automatic.
-// If Automatic, it SEARCHES for a match to determine if it is "Consuming" or "Not Consuming".
-func CheckInstanceConsumptionCore(ctx context.Context, req CheckConsumptionRequestShared, defaultProjectID string) (string, error) {
+func CheckInstanceConsumptionCore(ctx context.Context, req CheckConsumptionRequestShared, defaultProjectID string) (InstanceConsumptionStatus, error) {
 	WriteToLog("CheckInstanceConsumptionCore.0000")
+	
+	var status InstanceConsumptionStatus
+	status.InstanceName = req.InstanceName
+	status.Zone = req.Zone 
 
-	// 1. Determine Project ID
+	// Determine Project ID
 	projectID := req.ProjectID
 	if projectID == "" {
 		projectID = defaultProjectID
 	}
 	if projectID == "" {
-		return "Could not determine GCP project. Please run: gcloud config set project \"your-project-name\" and restart the AI Assistant", nil
+		status.ReservationStatus = "Error: Could not determine GCP project"
+		return status, nil
 	}
 
-	// 2. Initialize Compute Service
+	// Initialize Compute Service
 	service, err := compute.NewService(ctx, option.WithScopes(compute.ComputeScope))
 	if err != nil {
-		WriteToLog(fmt.Sprintf("CheckInstanceConsumptionCore Error creating service: %v", err))
-		return fmt.Sprintf("Failed to create compute service: %v", err), nil
+		status.ReservationStatus = fmt.Sprintf("Error creating service: %v", err)
+		return status, nil
 	}
 
 	var instance *compute.Instance
 
-	// 3. SMART SEARCH LOGIC (Finds the instance if Zone is missing)
+	// SMART SEARCH LOGIC (Finds the instance if Zone is missing)
 	if req.Zone == "" {
-		WriteToLog("CheckInstanceConsumptionCore: Zone is empty, searching for " + req.InstanceName)
-
 		filter := fmt.Sprintf("name = \"%s\"", req.InstanceName)
 		aggregatedListReq := service.Instances.AggregatedList(projectID).Filter(filter)
-
 		var foundInstances []*compute.Instance
 		var foundZones []string
 
@@ -711,80 +710,65 @@ func CheckInstanceConsumptionCore(ctx context.Context, req CheckConsumptionReque
 		})
 
 		if err != nil {
-			return fmt.Sprintf("Failed to search project: %v", err), nil
+			status.ReservationStatus = fmt.Sprintf("Error searching project: %v", err)
+			return status, nil
 		}
 		if len(foundInstances) == 0 {
-			return fmt.Sprintf("Error: Could not find instance '%s' in project '%s'.", req.InstanceName, projectID), nil
+			status.ReservationStatus = fmt.Sprintf("Error: Instance not found in project %s", projectID)
+			return status, nil
 		}
 		if len(foundInstances) > 1 {
-			return fmt.Sprintf("Error: Ambiguous. Found multiple instances named '%s' in zones: %v.", req.InstanceName, foundZones), nil
+			status.ReservationStatus = fmt.Sprintf("Error: Ambiguous. Found in multiple zones: %v", foundZones)
+			return status, nil
 		}
-
 		instance = foundInstances[0]
-		req.Zone = foundZones[0]
-		WriteToLog("CheckInstanceConsumptionCore: Found instance in zone " + req.Zone)
-
+		status.Zone = foundZones[0]
 	} else {
-		// Old Path: Zone provided
 		instance, err = service.Instances.Get(projectID, req.Zone, req.InstanceName).Context(ctx).Do()
 		if err != nil {
-			WriteToLog(fmt.Sprintf("CheckInstanceConsumptionCore Error getting instance: %v", err))
-			return fmt.Sprintf("Could not get instance %s in zone %s: %v", req.InstanceName, req.Zone, err), nil
+			status.ReservationStatus = fmt.Sprintf("Error: %v", err)
+			return status, nil
 		}
 	}
 
-	// 4. Analyze the Instance
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Analyzing Instance: %s (Zone: %s)\n", instance.Name, req.Zone))
-
-	// Check for SPOT
-	isSpot := false
+	// Check SPOT
 	if instance.Scheduling != nil {
 		if instance.Scheduling.ProvisioningModel == "SPOT" {
-			isSpot = true
-			sb.WriteString("Type: SPOT VM (No max duration)\n")
+			status.ProvisioningModel = "SPOT VM"
 		} else if instance.Scheduling.Preemptible {
-			isSpot = true
-			sb.WriteString("Type: LEGACY PREEMPTIBLE VM (24h max duration)\n")
+			status.ProvisioningModel = "LEGACY PREEMPTIBLE VM"
+		} else {
+			status.ProvisioningModel = "STANDARD VM"
 		}
-	}
-	if !isSpot {
-		sb.WriteString("Type: STANDARD VM\n")
+	} else {
+		status.ProvisioningModel = "STANDARD VM"
 	}
 
-	// Check for Reservation Usage
+	// Check Reservation
 	if instance.ReservationAffinity != nil {
 		switch instance.ReservationAffinity.ConsumeReservationType {
 		case "NO_RESERVATION":
-			sb.WriteString("Reservation: None (Explicitly configured to not use reservations)\n")
+			status.ReservationStatus = "None (Explicitly configured to not use reservations)"
 		case "ANY_RESERVATION":
-			// AUTOMATIC LOGIC: Search to see if we are actually consuming anything.
-			matchName, _ := findMatchingReservation(ctx, service, projectID, req.Zone, instance)
-
+			matchName, _ := findMatchingReservation(ctx, service, projectID, status.Zone, instance)
 			if matchName != "" {
-				// Case 1: Automatic AND Found a match
-				sb.WriteString(fmt.Sprintf("Reservation: Automatic (Consuming: %s)\n", matchName))
+				status.ReservationStatus = fmt.Sprintf("Automatic (Consuming: %s)", matchName)
 			} else {
-				// Case 2: Automatic BUT Found NOTHING (The "—" case in UI)
-				sb.WriteString("Reservation: Automatic (Current Status: Not consuming / On-Demand)\n")
+				status.ReservationStatus = "Automatic (Current Status: Not consuming / On-Demand)"
 			}
-
 		case "SPECIFIC_RESERVATION":
 			key := instance.ReservationAffinity.Key
 			val := ""
 			if len(instance.ReservationAffinity.Values) > 0 {
 				val = instance.ReservationAffinity.Values[0]
 			}
-			sb.WriteString(fmt.Sprintf("Reservation: CONSUMING SPECIFIC (Key: %s, Value: %s)\n", key, val))
+			status.ReservationStatus = fmt.Sprintf("Specific (Key: %s, Value: %s)", key, val)
 		default:
-			sb.WriteString("Reservation: None (On-Demand)\n")
+			status.ReservationStatus = "None (On-Demand)"
 		}
 	} else {
-		// Nil means On-Demand
-		sb.WriteString("Reservation: None (On-Demand / Default)\n")
+		status.ReservationStatus = "None (On-Demand)"
 	}
 
-	result := sb.String()
-	WriteToLog("CheckInstanceConsumptionCore result: " + result)
-	return result, nil
+	return status, nil
 }
