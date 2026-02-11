@@ -1,6 +1,6 @@
 ---
 name: compute-reservation-expert
-description: Senior-level skill for high-precision management and deep inspection of Google Cloud Compute Engine reservations and instance provisioning.
+description: Senior-level skill for high-precision management and deep inspection of Google Cloud Compute Engine reservations.
 ---
 
 # Compute Reservation Expert
@@ -26,126 +26,32 @@ When a user asks for specific "details", "machines", "GPUs", or "specs" for a na
 - **Output Presentation (Strict Enforcement):** You MUST parse the return JSON and display every field according to the official schema. Do not truncate arrays.
 
 #### **Technical Execution Report**
-1. **Metadata & Identity:** `name`, `id`, `selfLink`, `creationTimestamp`, `status`.
-2. **Capacity & Usage Matrix:** `count`, `inUseCount`, `assuredCount`, and `Remaining` (calculated as `count` - `inUseCount`).
-3. **Hardware Specifications:** List all `machineType`, `minCpuPlatform`, `guestAccelerators`, and `localSsds`.
-4. **Advanced Policies:** `specificReservationRequired`, `shareSettings`, and `resourceStatus`.
+1. **Metadata & Identity:**
+   - **Name:** `name`
+   - **ID:** `id`
+   - **SelfLink:** `selfLink`
+   - **Creation Date:** `creationTimestamp`
+   - **Status:** `status`
 
-### 3. Instance Provisioning & Affinity Analysis (NEW)
-When a user asks if an instance "has a reservation," "shows consumption," or is a "spot instance":
+2. **Capacity & Usage Matrix:**
+   - **Total Slots:** `specificReservation.count`
+   - **In-Use Count:** `specificReservation.inUseCount`
+   - **Assured Count:** `specificReservation.assuredCount`
+   - **Remaining:** (Calculation: `count` - `inUseCount`)
 
-#### **3.0 Two-Step Data Retrieval Workflow**
-**Step 1: Fetch Instance Basic Info**
-- **Tool:** `google-compute-mcp__get_instance_basic_info`
-- **Input:** `project`, `zone`, `instance` (instance name)
-- **Purpose:** Retrieve instance metadata and identify source template (if any)
+3. **Hardware Specifications (`instanceProperties`):**
+   - **Machine Type:** `machineType`
+   - **CPU Platform:** `minCpuPlatform`
+   - **Accelerators:** List every object in `guestAccelerators` (type and count).
+   - **Local SSDs:** List every entry in the `localSsds` array (interface and diskSizeGb).
 
-**Step 2: Fetch Instance Template Properties**
-- **Tool:** `google-compute-mcp__get_instance_template_properties`
-- **Input:** `project`, instance template name (extracted from Step 1)
-- **Purpose:** Retrieve scheduling and reservation affinity properties
-- **Note:** If Step 1 returns `sourceInstanceTemplate`, extract the template name and use it here
-
-**Fallback:** If no `sourceInstanceTemplate` exists, the instance was created directly with custom settings. In this case, check if `get_instance_basic_info` returns `scheduling` or `reservationAffinity` directly.
-
-#### **3.1 Instance Type Detection (Spot vs. Standard)**
-**Decision Tree (Execute in Order):**
-From `get_instance_template_properties` response, inspect `properties.scheduling`:
-
-1. **Check `properties.scheduling.provisioningModel`:**
-   - If field exists and equals `"SPOT"` → **Report: Spot Instance**
-   - If field exists and equals `"ON_DEMAND"` → Continue to step 2
-   - If field is missing/null → Continue to step 2
-
-2. **Check `properties.scheduling.preemptible`:**
-   - If `true` → **Report: Preemptible Instance (Legacy Spot)**
-   - If `false` or missing → **Report: Standard VM (On-Demand)**
-
-#### **3.2 Reservation Consumption Status**
-**Decision Logic (Execute in Order):**
-From `get_instance_template_properties` response, inspect `properties.reservationAffinity`:
-
-1. **Check if `properties.reservationAffinity` exists:**
-   - If missing/null → **Report: No Reservation Consumption (On-Demand Only)**
-   - If exists, proceed to step 2
-
-2. **Inspect `properties.reservationAffinity.consumeReservationType`:**
-   - **If `"SPECIFIC_RESERVATION"`:**
-     - Extract values from `properties.reservationAffinity.values` array (should contain one reservation name)
-     - **Report Format:** `Consuming Specific Reservation: [reservation-name]`
-     - Include reservation name in output for transparency
-   
-   - **If `"ANY_RESERVATION"`:**
-     - **Report Format:** `Consuming Any Available Reservation (Auto-Match)`
-     - The instance will consume any matching reservation in its zone
-   
-   - **If `"NO_RESERVATION"`:**
-     - **Report Format:** `No Reservation (On-Demand Only)`
-     - Instance runs on standard capacity without reservation guarantee
-
-3. **Edge Cases:**
-   - If `consumeReservationType` is missing but `reservationAffinity` exists → Report as "On-Demand (No Affinity Policy Set)"
-   - If `values` array is empty for SPECIFIC_RESERVATION → Report as "SPECIFIC_RESERVATION Mode (No Target Defined)"
-
-#### **3.3 Complete Instance Consumption Response**
-**Output Template (Always Include Both):**
-```
-Instance Name: [instance-name]
-Region/Zone: [zone]
-Source Template: [template-name or "Direct Instance"]
-Instance Type: [Spot Instance | Preemptible Instance | Standard VM]
-Reservation Status: [Consuming Specific Reservation: <name> | Consuming Any Available Reservation | No Reservation (On-Demand) | No Consumption Policy]
-```
+4. **Advanced Policies:**
+   - **Affinity:** `specificReservationRequired` (boolean)
+   - **Sharing:** `shareSettings` and `reservationSharingPolicy`
+   - **Resource State:** Full details from `resourceStatus`.
 
 ## Protocol & Guardrails
-
-### Two-Step Workflow (MANDATORY)
-**For ANY instance consumption query:**
-1. First call: `google-compute-mcp__get_instance_basic_info` with instance name
-2. Extract: `sourceInstanceTemplate` field if present
-3. Second call: `google-compute-mcp__get_instance_template_properties` with template name
-4. Parse: Properties from the template response to determine scheduling and reservation affinity
-
-### Error Handling & Fallback Strategy
-
-- **Instance Not Found (404):** If `get_instance_basic_info` returns "Not Found":
-  1. Suggest running `list_instances` to verify the instance name and zone
-  2. Confirm project and zone are correct
-  3. Ask user for exact instance name
-
-- **Template Not Found (404):** If `get_instance_template_properties` returns "Not Found":
-  1. The instance may have been created directly without a template
-  2. Ask if instance was created from template or directly with custom settings
-  3. Attempt to infer properties from basic instance info if available
-
-- **Missing Fields in Response:** 
-  - If `properties.scheduling` is missing → Treat as "Standard VM with default settings"
-  - If `properties.reservationAffinity` is missing → Report as "No Reservation Consumption"
-  - If any required field is null/undefined → Report as "Not Defined" in output
-
-### Response Completeness (Mandatory)
-- **For "Spot/Standard" queries:** ALWAYS report both instance type AND reservation status in one response
-- **For "Consumption" queries:** ALWAYS report the exact reservation name (if SPECIFIC_RESERVATION) or consumption type
-- **For "Has Reservation" queries:** ALWAYS provide boolean-like clarity: YES (with details) or NO
-
-### Query Interpretation
-- **"does X have a reservation?"** → Use section 3.2 logic to answer YES/NO with consumption details
-- **"show consumption of X"** → Provide section 3.3 output template with all fields
-- **"is X a spot instance?"** → Use section 3.1 logic to provide instance type and note any reservation affinity
-
-### Data Extraction Rules
-- `sourceInstanceTemplate` should be parsed from `get_instance_basic_info` response
-- `scheduling.provisioningModel` should be parsed from `properties.scheduling` in template response
-- `reservationAffinity.consumeReservationType` should be parsed from `properties.reservationAffinity` in template response
-- All array fields (`values`, `guestAccelerators`, `localSsds`) must be listed completely without truncation
-
-### Zero Truncation Rule
-- If a reservation contains multiple GPUs or SSDs, you are strictly forbidden from summarizing them. List each entry to ensure hardware interface visibility.
-
-### Schema Fidelity
-- Ensure your response labels match the API schema logic. If a field is missing in the JSON, report it as "Not Defined."
-
-### Context Awareness
-- Always check if the current `PROJECT_ID` is set in the environment before asking the user for it.
-- Verify zone is specified; if not, ask the user or suggest listing instances in available zones.
-
+- **Zero Truncation Rule:** If a reservation contains multiple GPUs or SSDs, you are strictly forbidden from summarizing them (e.g., "16 SSDs"). You must list each entry to ensure hardware interface visibility.
+- **Schema Fidelity:** Ensure your response labels match the API schema logic. If a field is missing in the JSON, report it as "Not Defined."
+- **Sequential Fallback:** If `get_reservation_details` fails due to a 'Not Found' error, automatically suggest or execute `list_reservations` to verify the correct name for the user.
+- **Context Awareness:** Always check if the current `PROJECT_ID` is set in the environment before asking the user.
