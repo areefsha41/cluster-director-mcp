@@ -1,5 +1,5 @@
 { 
   "mcpServers": { 
-	"google-compute-mcp": { "httpUrl": "https://compute.googleapis.com/mcp", "authProviderType": "google_credentials", "oauth": { "scopes": [ "https://www.googleapis.com/auth/compute.readonly" ] }, "trust": true,  "timeout": 60000 }
+"google-compute-mcp": { "httpUrl": "https://compute.googleapis.com/mcp", "authProviderType": "google_credentials", "oauth": { "scopes": [ "https://www.googleapis.com/auth/compute.readonly" ] }, "trust": true,  "timeout": 60000 }
    } 
 } 
